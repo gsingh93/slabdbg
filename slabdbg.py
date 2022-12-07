@@ -1,5 +1,16 @@
 import gdb
 
+def swab(x):
+    return int(
+        ((x & 0x00000000000000FF) << 56)
+        | ((x & 0x000000000000FF00) << 40)
+        | ((x & 0x0000000000FF0000) << 24)
+        | ((x & 0x00000000FF000000) << 8)
+        | ((x & 0x000000FF00000000) >> 8)
+        | ((x & 0x0000FF0000000000) >> 24)
+        | ((x & 0x00FF000000000000) >> 40)
+        | ((x & 0xFF00000000000000) >> 56)
+    )
 
 class KmemCacheAllocFinish(gdb.FinishBreakpoint):
     def __init__(self, command, name):
@@ -11,16 +22,6 @@ class KmemCacheAllocFinish(gdb.FinishBreakpoint):
         addr = int(self.return_value) & Slab.UNSIGNED_LONG
         return self.command.notify_alloc(self.name, addr)
 
-
-def swab(x):
-	return int((x & 0x00000000000000ff) << 56) |	\
-	((x & 0x000000000000ff00) << 40) |	\
-	((x & 0x0000000000ff0000) << 24) |	\
-	((x & 0x00000000ff000000) <<  8) |	\
-	((x & 0x000000ff00000000) >>  8) |	\
-	((x & 0x0000ff0000000000) >> 24) |	\
-	((x & 0x00ff000000000000) >> 40) |	\
-	((x & 0xff00000000000000) >> 56)
 
 class KmemCacheAlloc(gdb.Breakpoint):
     def __init__(self, command):
@@ -107,6 +108,16 @@ class Slab(gdb.Command):
         self.per_cpu_offset = gdb.lookup_global_symbol("__per_cpu_offset").value()
         self.memstart_addr = gdb.lookup_global_symbol("memstart_addr").value()
 
+        self.kimage_vaddr = int(gdb.parse_and_eval('(size_t)kimage_vaddr'))
+        self.kimage_voffset = self.kimage_vaddr - self.memstart_addr
+        self.phys_offset = self.memstart_addr
+        self.va_bits = 39
+        self.struct_page_max_shift = 6
+        self.page_shift = 12
+        self.page_offset = -(1 << self.va_bits) + 2**64
+        self.page_end = -(1 << (self.va_bits - 1))+2**64
+
+       # self.kmalloc_slab_alloc_bp = KmallocSlabAlloc(self)
         self.cache_alloc_bp = KmemCacheAlloc(self)
         self.cache_free_bp = KmemCacheFree(self)
         self.new_slab_bp = NewSlab(self)
@@ -233,33 +244,58 @@ class Slab(gdb.Command):
         cpu_slab = gdb.Value(slab_cache["cpu_slab"].cast(void) + cpu_offset)
         return cpu_slab.cast(kmem_cache_cpu.pointer()).dereference()
 
-    def page_addr(self, page):
-        memstart_addr = int(self.memstart_addr) & Slab.UNSIGNED_LONG
-        addr = (memstart_addr >> 6) & Slab.UNSIGNED_LONG
-        addr = (addr & 0xFFFFFFFFFF000000) & Slab.UNSIGNED_LONG
-        addr = (0xFFFFFFBDC0000000 - addr) & Slab.UNSIGNED_LONG
-        addr = (page - addr) & Slab.UNSIGNED_LONG
-        addr = (addr >> 6 << 0xC) & Slab.UNSIGNED_LONG
-        addr = (addr - memstart_addr) & Slab.UNSIGNED_LONG
-        return addr | 0xFFFFFFC000000000
+    def vmemmap_size(self, va_bits):
+        return (self.page_end - self.page_offset) >> (self.page_shift - self.struct_page_max_shift)
+
+    def page_addr(self, struct_page_addr):
+        vmemmap_size = self.vmemmap_size(39)
+
+        vmemmap_start = (-vmemmap_size - 2*1024*1024)+2**64
+        vmemmap = vmemmap_start - (self.memstart_addr >> (self.page_shift - self.struct_page_max_shift))
+
+        # page_to_pfn
+        pfn = (struct_page_addr - vmemmap) >> 6
+
+        # pfn_to_phys
+        phys_addr = pfn << self.page_shift
+
+        # phys_to_virt
+        virt_addr = (phys_addr - self.phys_offset) | self.page_offset
+
+        return virt_addr
 
     @staticmethod
     def walk_freelist(slab_cache, freelist):
         void = gdb.lookup_type("void").pointer().pointer()
         offset = int(slab_cache["offset"])
-        random = int(slab_cache["random"])
+
+        slab_cache_type = slab_cache.type
+        if slab_cache_type.code == gdb.TYPE_CODE_PTR:
+            slab_cache_type = slab_cache_type.target()
+
+        random = None
+        if "random" in slab_cache_type:
+            random = int(slab_cache["random"])
+
         while freelist:
             address = int(freelist) & Slab.UNSIGNED_LONG
             yield address
             freelist = int(gdb.Value(address + offset).cast(void).dereference())
-            freelist ^= random ^ swab(address+offset)
+            if random:
+                freelist ^= random ^ swab(address + offset)
 
     def format_slab(self, slab, indent, freelist=None):
+        slab_cache = slab["slab_cache"]
+        size = int(slab_cache["size"])
+        if freelist is None:
+            freelist = slab["freelist"]
+        freelist = list(Slab.walk_freelist(slab_cache, freelist))
+
         address = int(slab.address) & Slab.UNSIGNED_LONG
         s = "Slab @ 0x%x:" % address + "\n"
         objects = int(slab["objects"]) & Slab.UNSIGNED_INT
         s += " " * (indent + 4) + ("Objects: %d\n" % objects)
-        inuse = int(slab["inuse"]) & Slab.UNSIGNED_INT
+        inuse = int(slab["inuse"]) - len(freelist)
         s += " " * (indent + 4) + ("In-Use: %d\n" % inuse)
         frozen = int(slab["frozen"])
         s += " " * (indent + 4) + ("Frozen: %d\n" % frozen)
@@ -268,14 +304,9 @@ class Slab(gdb.Command):
 
         page_addr = self.page_addr(address)
         s += " " * (indent + 4) + ("Page @ 0x%x:\n" % page_addr)
-        slab_cache = slab["slab_cache"]
-        size = int(slab_cache["size"])
-        if freelist is None:
-            freelist = slab["freelist"]
-        freelist = list(Slab.walk_freelist(slab_cache, freelist))
         for address in range(page_addr, page_addr + objects * size, size):
             if address in freelist:
-                s += " " * (indent + 8) + (" - Object (free) @ 0x%x\n" % address)
+                s += " " * (indent + 8) + (" - Object (free)  @ 0x%x\n" % address)
             else:
                 s += " " * (indent + 8) + (" - Object (inuse) @ 0x%x\n" % address)
         return s.rstrip("\n")
@@ -288,7 +319,11 @@ class Slab(gdb.Command):
         for addr in self.slabs_list:
             slab = gdb.Value(addr).cast(page.pointer())
             slab_cache = slab["slab_cache"]
-            if slab_cache["name"].string() == name and int(slab["frozen"]) == 0 and not slab["freelist"]:
+            if (
+                slab_cache["name"].string() == name
+                and int(slab["frozen"]) == 0
+                and not slab["freelist"]
+            ):
                 yield slab.dereference()
 
     def invoke(self, arg, from_tty):
@@ -340,12 +375,16 @@ class Slab(gdb.Command):
         print("  slab list - Display simple information about all slab caches")
         print("  slab info <name> - Display extended information about a slab cache")
         print("  slab trace <name> - Start/stop tracing allocations for a slab cache")
-        print("  slab break <name> - Start/stop breaking on allocation for a slab cache")
+        print(
+            "  slab break <name> - Start/stop breaking on allocation for a slab cache"
+        )
         print("  slab watch <name> - Start/stop watching full-slabs for a slab cache")
         print("  slab print <slab> - Print the objects contained in a slab")
 
     def invoke_list(self):
-        print("name                    objs inuse slabs size obj_size objs_per_slab pages_per_slab")
+        print(
+            "name                    objs inuse slabs size obj_size objs_per_slab pages_per_slab"
+        )
         for slab_cache in self.iter_slab_caches():
             name = slab_cache["name"].string()
             size = int(slab_cache["size"])
@@ -380,7 +419,16 @@ class Slab(gdb.Command):
 
             print(
                 "%-23s %4d %5d %5d %4d %8d %13d %14d"
-                % (name, objs, inuse, slabs, size, obj_size, objs_per_slab, pages_per_slab)
+                % (
+                    name,
+                    objs,
+                    inuse,
+                    slabs,
+                    size,
+                    obj_size,
+                    objs_per_slab,
+                    pages_per_slab,
+                )
             )
 
     def invoke_info(self, name):
@@ -413,14 +461,21 @@ class Slab(gdb.Command):
         print("        Freelist: 0x%x" % freelist)
         if cpu_cache["page"]:
             slab = cpu_cache["page"].dereference()
-            print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
+            print("        Page:")
+            print(
+                "            - "
+                + self.format_slab(slab, 14, cpu_cache["freelist"])
+            )
         else:
             print("        Page: (none)")
         if cpu_cache["partial"]:
             print("        Partial List:")
             slab = cpu_cache["partial"]
             while slab:
-                print("            - " + self.format_slab(slab.dereference(), 14, cpu_cache["freelist"]))
+                print(
+                    "            - "
+                    + self.format_slab(slab.dereference(), 14)
+                )
                 slab = slab.dereference()["next"]
         else:
             print("        Partial List: (none)")
