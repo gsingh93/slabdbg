@@ -108,7 +108,7 @@ class Slab(gdb.Command):
         self.per_cpu_offset = gdb.lookup_global_symbol("__per_cpu_offset").value()
         self.memstart_addr = gdb.lookup_global_symbol("memstart_addr").value()
 
-        self.kimage_vaddr = int(gdb.parse_and_eval('(size_t)kimage_vaddr'))
+        self.kimage_vaddr = int(gdb.parse_and_eval('*(size_t*)kimage_vaddr'))
         self.kimage_voffset = self.kimage_vaddr - self.memstart_addr
         self.phys_offset = self.memstart_addr
         self.va_bits = 39
