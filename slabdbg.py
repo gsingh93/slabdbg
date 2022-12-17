@@ -287,15 +287,21 @@ class Slab(gdb.Command):
     def format_slab(self, slab, indent, freelist=None):
         slab_cache = slab["slab_cache"]
         size = int(slab_cache["size"])
+        is_partial = False
         if freelist is None:
             freelist = slab["freelist"]
+            is_partial = True
         freelist = list(Slab.walk_freelist(slab_cache, freelist))
 
         address = int(slab.address) & Slab.UNSIGNED_LONG
         s = "Slab @ 0x%x:" % address + "\n"
         objects = int(slab["objects"]) & Slab.UNSIGNED_INT
         s += " " * (indent + 4) + ("Objects: %d\n" % objects)
-        inuse = int(slab["inuse"]) - len(freelist)
+
+        # inuse is calculated differently between CPU and partial slabs
+        inuse = int(slab["inuse"])
+        if not is_partial:
+            inuse = int(slab["objects"]) - len(freelist)
         s += " " * (indent + 4) + ("In-Use: %d\n" % inuse)
         frozen = int(slab["frozen"])
         s += " " * (indent + 4) + ("Frozen: %d\n" % frozen)
