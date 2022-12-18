@@ -303,6 +303,13 @@ class Slab(gdb.Command):
         if not is_partial:
             inuse = int(slab["objects"]) - len(freelist)
         s += " " * (indent + 4) + ("In-Use: %d\n" % inuse)
+
+        if is_partial:
+            pobjects = slab["pobjects"]
+            s += " " * (indent + 4) + ("Pobjects: %d\n" % pobjects)
+            pages = slab["pages"]
+            s += " " * (indent + 4) + ("Pages: %d\n" % pages)
+
         frozen = int(slab["frozen"])
         s += " " * (indent + 4) + ("Frozen: %d\n" % frozen)
         fp = int(slab["freelist"]) & Slab.UNSIGNED_LONG
